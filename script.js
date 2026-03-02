@@ -8,6 +8,8 @@ const CLICK_MOVE_TOLERANCE = 6;
 const MAX_PARTICLES = 260;
 const RHYTHM_BPM = 132;
 const RHYTHM_WINDOW_MS = 100;
+const RHYTHM_GREAT_MS = 160;
+const RHYTHM_GOOD_MS = 220;
 const RHYTHM_SCAN_BEATS = 4;
 
 const LINE_POINTS = [0, 40, 100, 300, 1200];
@@ -30,6 +32,28 @@ const SHAPES = {
   S: [[0, 1, 1], [1, 1, 0]],
   T: [[0, 1, 0], [1, 1, 1]],
   Z: [[1, 1, 0], [0, 1, 1]],
+};
+
+const SRS_KICKS_JLSTZ = {
+  "0>1": [[0, 0], [-1, 0], [-1, 1], [0, -2], [-1, -2]],
+  "1>0": [[0, 0], [1, 0], [1, -1], [0, 2], [1, 2]],
+  "1>2": [[0, 0], [1, 0], [1, -1], [0, 2], [1, 2]],
+  "2>1": [[0, 0], [-1, 0], [-1, 1], [0, -2], [-1, -2]],
+  "2>3": [[0, 0], [1, 0], [1, 1], [0, -2], [1, -2]],
+  "3>2": [[0, 0], [-1, 0], [-1, -1], [0, 2], [-1, 2]],
+  "3>0": [[0, 0], [-1, 0], [-1, -1], [0, 2], [-1, 2]],
+  "0>3": [[0, 0], [1, 0], [1, 1], [0, -2], [1, -2]],
+};
+
+const SRS_KICKS_I = {
+  "0>1": [[0, 0], [-2, 0], [1, 0], [-2, -1], [1, 2]],
+  "1>0": [[0, 0], [2, 0], [-1, 0], [2, 1], [-1, -2]],
+  "1>2": [[0, 0], [-1, 0], [2, 0], [-1, 2], [2, -1]],
+  "2>1": [[0, 0], [1, 0], [-2, 0], [1, -2], [-2, 1]],
+  "2>3": [[0, 0], [2, 0], [-1, 0], [2, 1], [-1, -2]],
+  "3>2": [[0, 0], [-2, 0], [1, 0], [-2, -1], [1, 2]],
+  "3>0": [[0, 0], [1, 0], [-2, 0], [1, -2], [-2, 1]],
+  "0>3": [[0, 0], [-1, 0], [2, 0], [-1, 2], [2, -1]],
 };
 
 const gameCanvas = document.getElementById("gameCanvas");
@@ -125,8 +149,11 @@ function createRhythmState() {
     perfectText: "",
     perfectTextAge: 0,
     perfectTextLife: 0,
+    perfectTextColor: "#82ffe2",
     beatPulse: 0,
     perfectFlash: 0,
+    scanPrevX: 0,
+    scanPrevCycle: 0,
   };
 }
 
@@ -180,17 +207,26 @@ function getRhythmBeatFloat() {
   return getRhythmClockTime() / getRhythmBeatDuration();
 }
 
-function evaluatePerfectTiming() {
+function evaluateRhythmJudgement() {
   if (state.mode !== "rhythm" || state.paused || state.gameOver) {
-    return { isPerfect: false, diffMs: Infinity };
+    return { grade: "None", diffMs: Infinity };
   }
   const beatDuration = getRhythmBeatDuration();
   const elapsed = getRhythmClockTime();
   const beatPos = elapsed / beatDuration;
   const nearest = Math.round(beatPos) * beatDuration;
   const diffMs = Math.abs(elapsed - nearest) * 1000;
+  if (diffMs <= state.rhythm.beatWindowMs) {
+    return { grade: "Perfect", diffMs };
+  }
+  if (diffMs <= RHYTHM_GREAT_MS) {
+    return { grade: "Great", diffMs };
+  }
+  if (diffMs <= RHYTHM_GOOD_MS) {
+    return { grade: "Good", diffMs };
+  }
   return {
-    isPerfect: diffMs <= state.rhythm.beatWindowMs,
+    grade: "Miss",
     diffMs,
   };
 }
@@ -218,6 +254,7 @@ function createPiece(type) {
   return {
     type,
     matrix: cloneShape(SHAPES[type]),
+    rotation: 0,
     x: Math.floor(COLS / 2) - 2,
     y: -1,
   };
@@ -260,6 +297,17 @@ function merge(board, piece) {
 function rotate(matrix, dir) {
   const rotated = matrix[0].map((_, x) => matrix.map((row) => row[x]));
   return dir > 0 ? rotated.map((row) => row.reverse()) : rotated.reverse();
+}
+
+function getKickTests(type, fromRotation, toRotation) {
+  if (type === "O") {
+    return [[0, 0]];
+  }
+  const key = `${fromRotation}>${toRotation}`;
+  if (type === "I") {
+    return SRS_KICKS_I[key] || [[0, 0]];
+  }
+  return SRS_KICKS_JLSTZ[key] || [[0, 0]];
 }
 
 function kickJelly(scaleXDelta, scaleYDelta, rotDelta = 0, pulse = 0.06) {
@@ -440,6 +488,8 @@ function startMagicBgm() {
   state.rhythm.fallbackStartAt = performance.now() / 1000;
   state.rhythm.lastBeatIndex = -1;
   state.rhythm.scanCycle = 0;
+  state.rhythm.scanPrevCycle = 0;
+  state.rhythm.scanPrevX = 0;
   scheduleMagicBgm();
   audioEngine.bgmTimer = window.setInterval(scheduleMagicBgm, 45);
 }
@@ -581,9 +631,7 @@ function clearLines() {
 }
 
 function collectFullRowsExcludingPending() {
-  const pendingRows = new Set(
-    state.rhythm.pendingClears.flatMap((entry) => entry.rows),
-  );
+  const pendingRows = new Set(state.rhythm.pendingClears.map((entry) => entry.row));
   const fullRows = [];
   for (let y = ROWS - 1; y >= 0; y -= 1) {
     if (pendingRows.has(y)) {
@@ -623,60 +671,122 @@ function queueRhythmClears(rows, colorHex) {
   if (rows.length === 0) {
     return;
   }
-  const uniqueRows = [...new Set(rows)].sort((a, b) => a - b);
-  state.rhythm.pendingClears.push({
-    rows: uniqueRows,
-    count: uniqueRows.length,
-    queuedCycle: state.rhythm.scanCycle,
-    color: colorHex,
+  const existingRows = new Set(state.rhythm.pendingClears.map((entry) => entry.row));
+  const uniqueRows = [...new Set(rows)]
+    .filter((row) => !existingRows.has(row))
+    .sort((a, b) => a - b);
+
+  uniqueRows.forEach((row) => {
+    state.rhythm.pendingClears.push({
+      row,
+      queuedCycle: state.rhythm.scanCycle,
+      color: colorHex,
+      cleared: Array(COLS).fill(false),
+      clearedCount: 0,
+    });
   });
 }
 
-function resolveRhythmScanClears() {
-  if (state.rhythm.pendingClears.length === 0) {
-    return;
-  }
-  const mature = [];
-  const remain = [];
-  state.rhythm.pendingClears.forEach((entry) => {
-    if (state.rhythm.scanCycle > entry.queuedCycle) {
-      mature.push(entry);
-    } else {
-      remain.push(entry);
-    }
-  });
-  if (mature.length === 0) {
+function applyScanSegment(scanCycle, fromX, toX) {
+  if (toX <= fromX || state.rhythm.pendingClears.length === 0) {
     return;
   }
 
-  const rowsToClear = [...new Set(mature.flatMap((entry) => entry.rows))];
+  const startCol = Math.max(0, Math.floor(fromX));
+  const endCol = Math.min(COLS - 1, Math.floor(toX - 1e-6));
+  if (endCol < startCol) {
+    return;
+  }
+
+  state.rhythm.pendingClears.forEach((entry) => {
+    if (entry.queuedCycle >= scanCycle) {
+      return;
+    }
+    const rowData = state.board[entry.row];
+    if (!rowData) {
+      return;
+    }
+    for (let col = startCol; col <= endCol; col += 1) {
+      if (entry.cleared[col]) {
+        continue;
+      }
+      entry.cleared[col] = true;
+      entry.clearedCount += 1;
+      if (rowData[col]) {
+        rowData[col] = null;
+      }
+      if (Math.random() < 0.45) {
+        addParticle(
+          (col + 0.5) * CELL,
+          (entry.row + 0.5) * CELL,
+          entry.color,
+          0.58,
+        );
+      }
+    }
+  });
+}
+
+function resolveRhythmScanClears(scanCycle, scanX) {
+  const prevCycle = state.rhythm.scanPrevCycle;
+  const prevX = state.rhythm.scanPrevX;
+
+  if (scanCycle > prevCycle) {
+    applyScanSegment(prevCycle, prevX, COLS);
+    for (let cycle = prevCycle + 1; cycle < scanCycle; cycle += 1) {
+      applyScanSegment(cycle, 0, COLS);
+    }
+    applyScanSegment(scanCycle, 0, scanX);
+  } else {
+    applyScanSegment(scanCycle, prevX, scanX);
+  }
+
+  if (state.rhythm.pendingClears.length === 0) {
+    state.rhythm.scanPrevCycle = scanCycle;
+    state.rhythm.scanPrevX = scanX;
+    return;
+  }
+
+  const mature = state.rhythm.pendingClears.filter((entry) => entry.clearedCount >= COLS);
+  if (mature.length === 0) {
+    state.rhythm.scanPrevCycle = scanCycle;
+    state.rhythm.scanPrevX = scanX;
+    return;
+  }
+
+  const rowsToClear = [...new Set(mature.map((entry) => entry.row))];
   if (rowsToClear.length === 0) {
-    state.rhythm.pendingClears = remain;
+    state.rhythm.scanPrevCycle = scanCycle;
+    state.rhythm.scanPrevX = scanX;
     return;
   }
 
   const removedRows = removeRowsFromBoard(rowsToClear);
-  remain.forEach((entry) => {
-    entry.rows = remapPendingRowsAfterRemoval(entry.rows, removedRows);
-    entry.count = entry.rows.length;
+  state.rhythm.pendingClears = state.rhythm.pendingClears.filter(
+    (entry) => !rowsToClear.includes(entry.row),
+  );
+  state.rhythm.pendingClears.forEach((entry) => {
+    const mapped = remapPendingRowsAfterRemoval([entry.row], removedRows);
+    entry.row = mapped.length ? mapped[0] : -1;
   });
-  state.rhythm.pendingClears = remain.filter((entry) => entry.count > 0);
+  state.rhythm.pendingClears = state.rhythm.pendingClears.filter((entry) => entry.row >= 0);
 
   const previousLevel = state.level;
-  mature.forEach((entry) => {
-    const lines = Math.max(1, Math.min(4, entry.count));
-    state.lines += entry.count;
-    state.score += LINE_POINTS[lines] * state.level;
-  });
+  const clearedCount = removedRows.length;
+  state.lines += clearedCount;
+  state.score += LINE_POINTS[Math.max(1, Math.min(4, clearedCount))] * state.level;
 
   updateLevelByLines(state.lines);
   if (state.level > previousLevel) {
     playSfx("levelUp");
   }
-  const accentColor = mature[mature.length - 1].color || "#66d1ff";
+  const accentColor = mature[mature.length - 1]?.color || "#66d1ff";
   triggerLineClearFx(removedRows, accentColor);
   state.boardPulse = Math.min(1.55, state.boardPulse + 0.38 + removedRows.length * 0.2);
   updateStats();
+
+  state.rhythm.scanPrevCycle = scanCycle;
+  state.rhythm.scanPrevX = scanX;
 }
 
 function addParticle(x, y, color, energy = 1) {
@@ -745,26 +855,31 @@ function updateVisualEffects(dt) {
   }
 }
 
-function triggerPerfect(action) {
-  const scoreBonus = action === "hardDrop" ? 80 : 28;
-  const energyGain = action === "hardDrop" ? 9 : 5;
-  state.score += scoreBonus;
-  state.rhythm.perfectEnergy = clamp(state.rhythm.perfectEnergy + energyGain, 0, 100);
-  state.rhythm.perfectText = `Perfect +${scoreBonus}`;
+function applyRhythmJudgement(grade, action) {
+  const isHardDrop = action === "hardDrop";
+  const table = {
+    Perfect: { score: isHardDrop ? 80 : 28, energy: isHardDrop ? 9 : 5, flash: 0.42, color: "#82ffe2" },
+    Great: { score: isHardDrop ? 45 : 16, energy: isHardDrop ? 5 : 3, flash: 0.3, color: "#78d7ff" },
+    Good: { score: isHardDrop ? 20 : 8, energy: isHardDrop ? 2 : 1, flash: 0.18, color: "#ffe38a" },
+    Miss: { score: 0, energy: -4, flash: 0.06, color: "#ff9ca4" },
+  };
+  const cfg = table[grade] || table.Miss;
+  state.score += cfg.score;
+  state.rhythm.perfectEnergy = clamp(state.rhythm.perfectEnergy + cfg.energy, 0, 100);
+  state.rhythm.perfectText = cfg.score > 0 ? `${grade} +${cfg.score}` : grade;
+  state.rhythm.perfectTextColor = cfg.color;
   state.rhythm.perfectTextAge = 0;
-  state.rhythm.perfectTextLife = 0.75;
-  state.rhythm.perfectFlash = Math.min(1, state.rhythm.perfectFlash + 0.42);
+  state.rhythm.perfectTextLife = 0.7;
+  state.rhythm.perfectFlash = Math.min(1, state.rhythm.perfectFlash + cfg.flash);
 }
 
 function handleRhythmTimingBonus(action) {
   if (state.mode !== "rhythm") {
     return;
   }
-  const { isPerfect } = evaluatePerfectTiming();
-  if (isPerfect) {
-    triggerPerfect(action);
-    updateStats();
-  }
+  const { grade } = evaluateRhythmJudgement();
+  applyRhythmJudgement(grade, action);
+  updateStats();
 }
 
 function applyRhythmBeatDrop() {
@@ -794,9 +909,11 @@ function updateRhythmSystem() {
   }
 
   const scanProgress = (beatFloat % state.rhythm.scanBeats) / state.rhythm.scanBeats;
-  state.rhythm.scanX = clamp(scanProgress, 0, 1) * COLS;
-  state.rhythm.scanCycle = Math.floor(beatFloat / state.rhythm.scanBeats);
-  resolveRhythmScanClears();
+  const scanX = clamp(scanProgress, 0, 1) * COLS;
+  const scanCycle = Math.floor(beatFloat / state.rhythm.scanBeats);
+  state.rhythm.scanX = scanX;
+  state.rhythm.scanCycle = scanCycle;
+  resolveRhythmScanClears(scanCycle, scanX);
 }
 
 function spawnPiece() {
@@ -1010,7 +1127,7 @@ function drawMatrix(targetCtx, matrix, offsetX, offsetY, type, options = {}) {
 
 function drawBoard() {
   const pendingRows = state.mode === "rhythm"
-    ? new Set(state.rhythm.pendingClears.flatMap((entry) => entry.rows))
+    ? new Set(state.rhythm.pendingClears.map((entry) => entry.row))
     : null;
   for (let y = 0; y < ROWS; y += 1) {
     for (let x = 0; x < COLS; x += 1) {
@@ -1195,7 +1312,8 @@ function drawRhythmOverlay() {
     const yOffset = t * 24;
     ctx.font = "700 26px 'Space Grotesk', 'Noto Sans SC', sans-serif";
     ctx.textAlign = "center";
-    ctx.fillStyle = `rgba(130, 255, 226, ${0.9 * alpha})`;
+    const color = state.rhythm.perfectTextColor || "#82ffe2";
+    ctx.fillStyle = rgba(color, 0.9 * alpha);
     ctx.fillText(state.rhythm.perfectText, gameCanvas.width / 2, 92 - yOffset);
   }
   ctx.restore();
@@ -1310,10 +1428,18 @@ function rotateCurrent(dir = 1) {
   }
   const original = state.current.matrix;
   const originalX = state.current.x;
-  state.current.matrix = rotate(state.current.matrix, dir);
-  const offsets = [0, -1, 1, -2, 2];
-  for (const offset of offsets) {
-    state.current.x = originalX + offset;
+  const originalY = state.current.y;
+  const fromRotation = state.current.rotation || 0;
+  const toRotation = (fromRotation + (dir > 0 ? 1 : 3)) % 4;
+  const rotated = rotate(state.current.matrix, dir);
+  const tests = getKickTests(state.current.type, fromRotation, toRotation);
+
+  for (const [kickX, kickY] of tests) {
+    state.current.matrix = rotated;
+    state.current.rotation = toRotation;
+    state.current.x = originalX + kickX;
+    state.current.y = originalY - kickY;
+
     if (!collide(state.board, state.current)) {
       handleRhythmTimingBonus("rotate");
       playSfx("rotate");
@@ -1321,8 +1447,11 @@ function rotateCurrent(dir = 1) {
       return;
     }
   }
+
   state.current.matrix = original;
+  state.current.rotation = fromRotation;
   state.current.x = originalX;
+  state.current.y = originalY;
 }
 
 function holdPiece() {
@@ -1450,7 +1579,7 @@ function switchMode(mode) {
   state.mode = mode;
   resetGame();
   if (mode === "rhythm") {
-    showOverlay("音游模式", "按节拍操作，命中 ±100ms 会得到 Perfect");
+    showOverlay("音游模式", "按节拍操作，判定为 Perfect / Great / Good / Miss");
     setTimeout(() => {
       if (!state.paused && !state.gameOver && state.mode === "rhythm") {
         hideOverlay();
