@@ -1,11 +1,11 @@
 const COLS = 10;
 const ROWS = 20;
 
-const BASE_FALL_SPEED = 1.05;
-const LEVEL_FALL_SPEED_STEP = 0.2;
+const BASE_FALL_SPEED = 0.82;
 const SOFT_DROP_STEP = 0.65;
 const DRAG_STEP_PX = 24;
 const CLICK_MOVE_TOLERANCE = 6;
+const MAX_PARTICLES = 260;
 
 const LINE_POINTS = [0, 40, 100, 300, 1200];
 
@@ -47,6 +47,12 @@ const touchButtons = Array.from(document.querySelectorAll(".touch-controls butto
 
 const CELL = gameCanvas.width / COLS;
 
+const audioEngine = {
+  context: null,
+  master: null,
+  lastPlayAt: {},
+};
+
 const state = {
   board: createMatrix(COLS, ROWS),
   bag: [],
@@ -62,6 +68,9 @@ const state = {
   lastTime: 0,
   renderTime: 0,
   boardPulse: 0,
+  lineBursts: [],
+  particles: [],
+  screenFlash: 0,
   paused: false,
   gameOver: false,
   jelly: createJellyState(),
@@ -85,6 +94,28 @@ function createJellyState() {
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function calcFallSpeed(level) {
+  const lv = Math.max(1, level);
+  const earlyCurve = Math.pow(lv - 1, 1.15) * 0.08;
+  const lateCurve = Math.pow(Math.max(0, lv - 12), 1.8) * 0.016;
+  return BASE_FALL_SPEED + earlyCurve + lateCurve;
+}
+
+function hexToRgb(hex) {
+  const raw = hex.replace("#", "");
+  const parsed = Number.parseInt(raw, 16);
+  return {
+    r: (parsed >> 16) & 255,
+    g: (parsed >> 8) & 255,
+    b: parsed & 255,
+  };
+}
+
+function rgba(hex, alpha) {
+  const { r, g, b } = hexToRgb(hex);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
 function shuffle(arr) {
@@ -184,9 +215,182 @@ function updateJelly(dt) {
   state.boardPulse = Math.max(0, state.boardPulse - dt * 1.12);
 }
 
+function getAudioContext() {
+  if (audioEngine.context) {
+    return audioEngine.context;
+  }
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) {
+    return null;
+  }
+  const context = new Ctx();
+  const master = context.createGain();
+  master.gain.value = 0.38;
+  master.connect(context.destination);
+  audioEngine.context = context;
+  audioEngine.master = master;
+  return context;
+}
+
+function unlockAudio() {
+  const context = getAudioContext();
+  if (!context) {
+    return;
+  }
+  if (context.state === "suspended") {
+    context.resume().catch(() => {});
+  }
+}
+
+function canPlaySfx(key, cooldownMs = 0) {
+  const now = performance.now();
+  const last = audioEngine.lastPlayAt[key] ?? -Infinity;
+  if (now - last < cooldownMs) {
+    return false;
+  }
+  audioEngine.lastPlayAt[key] = now;
+  return true;
+}
+
+function playTone({
+  freq,
+  toFreq = freq,
+  type = "sine",
+  duration = 0.09,
+  volume = 0.22,
+  attack = 0.005,
+  release = 0.085,
+  when = 0,
+}) {
+  const context = getAudioContext();
+  if (!context || context.state !== "running") {
+    return;
+  }
+  const osc = context.createOscillator();
+  const gain = context.createGain();
+  const now = context.currentTime + when;
+  const endTime = now + duration;
+  const releaseTime = Math.max(now + attack, endTime - release);
+
+  osc.type = type;
+  osc.frequency.setValueAtTime(Math.max(35, freq), now);
+  osc.frequency.exponentialRampToValueAtTime(Math.max(35, toFreq), endTime);
+
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(Math.max(0.0001, volume), now + attack);
+  gain.gain.exponentialRampToValueAtTime(0.0001, releaseTime);
+  gain.gain.setValueAtTime(0.0001, endTime);
+
+  osc.connect(gain);
+  gain.connect(audioEngine.master);
+  osc.start(now);
+  osc.stop(endTime + 0.012);
+}
+
+function playSfx(name, payload = {}) {
+  if (!audioEngine.context || audioEngine.context.state !== "running") {
+    return;
+  }
+
+  switch (name) {
+    case "move": {
+      if (!canPlaySfx("move", 34)) {
+        return;
+      }
+      const base = payload.dir < 0 ? 198 : 224;
+      playTone({ freq: base, toFreq: base * 1.03, type: "triangle", duration: 0.038, volume: 0.05 });
+      break;
+    }
+    case "rotate": {
+      if (!canPlaySfx("rotate", 62)) {
+        return;
+      }
+      playTone({ freq: 310, toFreq: 520, type: "square", duration: 0.075, volume: 0.055 });
+      break;
+    }
+    case "softDrop": {
+      if (!canPlaySfx("softDrop", 58)) {
+        return;
+      }
+      playTone({ freq: 176, toFreq: 148, type: "triangle", duration: 0.05, volume: 0.04 });
+      break;
+    }
+    case "hardDrop": {
+      playTone({ freq: 260, toFreq: 110, type: "sawtooth", duration: 0.12, volume: 0.07 });
+      playTone({ freq: 90, toFreq: 72, type: "sine", duration: 0.09, volume: 0.055, when: 0.028 });
+      break;
+    }
+    case "lock": {
+      if (!canPlaySfx("lock", 45)) {
+        return;
+      }
+      playTone({ freq: 120, toFreq: 96, type: "triangle", duration: 0.06, volume: 0.05 });
+      break;
+    }
+    case "hold": {
+      if (!canPlaySfx("hold", 80)) {
+        return;
+      }
+      playTone({ freq: 340, toFreq: 248, type: "triangle", duration: 0.09, volume: 0.05 });
+      break;
+    }
+    case "clear": {
+      const lines = Math.max(1, Math.min(4, payload.lines || 1));
+      const chord = [523.25, 659.25, 783.99, 987.77];
+      for (let i = 0; i < lines; i += 1) {
+        playTone({
+          freq: chord[i],
+          toFreq: chord[i] * 1.02,
+          type: "square",
+          duration: 0.11,
+          volume: 0.06 + i * 0.01,
+          when: i * 0.032,
+        });
+      }
+      break;
+    }
+    case "levelUp": {
+      [440, 554.37, 739.99, 880].forEach((freq, idx) => {
+        playTone({
+          freq,
+          toFreq: freq * 1.04,
+          type: "triangle",
+          duration: 0.11,
+          volume: 0.065,
+          when: idx * 0.04,
+        });
+      });
+      break;
+    }
+    case "pause": {
+      playTone({ freq: 290, toFreq: 240, type: "sine", duration: 0.075, volume: 0.045 });
+      break;
+    }
+    case "resume": {
+      playTone({ freq: 240, toFreq: 305, type: "sine", duration: 0.075, volume: 0.045 });
+      break;
+    }
+    case "gameOver": {
+      [240, 182, 146, 110].forEach((freq, idx) => {
+        playTone({
+          freq,
+          toFreq: Math.max(60, freq - 22),
+          type: "sawtooth",
+          duration: 0.12,
+          volume: 0.06,
+          when: idx * 0.055,
+        });
+      });
+      break;
+    }
+    default:
+      break;
+  }
+}
+
 function updateLevelByLines(totalLines) {
   state.level = Math.floor(totalLines / 10) + 1;
-  state.fallSpeed = BASE_FALL_SPEED + (state.level - 1) * LEVEL_FALL_SPEED_STEP;
+  state.fallSpeed = calcFallSpeed(state.level);
 }
 
 function updateStats() {
@@ -196,16 +400,72 @@ function updateStats() {
 }
 
 function clearLines() {
-  let linesCleared = 0;
+  const clearedRows = [];
   for (let y = ROWS - 1; y >= 0; y -= 1) {
     if (state.board[y].every((cell) => Boolean(cell))) {
+      clearedRows.push(y);
       state.board.splice(y, 1);
       state.board.unshift(Array(COLS).fill(null));
-      linesCleared += 1;
       y += 1;
     }
   }
-  return linesCleared;
+  return clearedRows;
+}
+
+function addParticle(x, y, color, energy = 1) {
+  if (state.particles.length >= MAX_PARTICLES) {
+    state.particles.shift();
+  }
+  state.particles.push({
+    x,
+    y,
+    vx: (Math.random() * 2 - 1) * 210 * energy,
+    vy: (-90 - Math.random() * 210) * energy,
+    size: 1.8 + Math.random() * 3.4,
+    age: 0,
+    life: 0.42 + Math.random() * 0.34,
+    color,
+  });
+}
+
+function triggerLineClearFx(rows, colorHex) {
+  const rowList = [...rows].sort((a, b) => a - b);
+  rowList.forEach((row, index) => {
+    state.lineBursts.push({
+      row,
+      age: 0,
+      life: 0.36 + index * 0.04,
+      strength: 0.85 + rowList.length * 0.16,
+      color: colorHex,
+    });
+
+    const y = (row + 0.5) * CELL;
+    const perRow = 18 + rowList.length * 4;
+    for (let i = 0; i < perRow; i += 1) {
+      const x = (i / Math.max(1, perRow - 1)) * gameCanvas.width;
+      addParticle(x, y, colorHex, 0.9 + rowList.length * 0.1);
+    }
+  });
+
+  state.screenFlash = Math.min(1.2, state.screenFlash + 0.26 + rowList.length * 0.14);
+}
+
+function updateVisualEffects(dt) {
+  state.lineBursts = state.lineBursts.filter((burst) => {
+    burst.age += dt;
+    return burst.age < burst.life;
+  });
+
+  state.particles = state.particles.filter((particle) => {
+    particle.age += dt;
+    particle.x += particle.vx * dt;
+    particle.y += particle.vy * dt;
+    particle.vy += 640 * dt;
+    particle.vx *= Math.exp(-2.8 * dt);
+    return particle.age < particle.life;
+  });
+
+  state.screenFlash = Math.max(0, state.screenFlash - dt * 1.7);
 }
 
 function spawnPiece() {
@@ -218,21 +478,30 @@ function spawnPiece() {
 
   if (collide(state.board, state.current)) {
     state.gameOver = true;
+    playSfx("gameOver");
     showOverlay("游戏结束", "按回车或点击“重新开始”");
   }
 }
 
 function lockPiece() {
   merge(state.board, state.current);
-  const cleared = clearLines();
+  const previousLevel = state.level;
+  const clearedRows = clearLines();
+  const cleared = clearedRows.length;
 
   if (cleared > 0) {
     state.lines += cleared;
     state.score += LINE_POINTS[cleared] * state.level;
     updateLevelByLines(state.lines);
+    triggerLineClearFx(clearedRows, COLORS[state.current.type]);
+    playSfx("clear", { lines: cleared });
+    if (state.level > previousLevel) {
+      playSfx("levelUp");
+    }
     state.boardPulse = Math.min(1.45, state.boardPulse + 0.35 + cleared * 0.22);
     kickJelly(0.18, -0.24, 0, 0.46);
   } else {
+    playSfx("lock");
     state.boardPulse = Math.min(1.15, state.boardPulse + 0.18);
     kickJelly(0.11, -0.14, 0, 0.24);
   }
@@ -505,12 +774,51 @@ function drawMiniCanvas(targetCtx, type) {
   });
 }
 
+function drawVisualEffects() {
+  if (state.lineBursts.length === 0 && state.particles.length === 0 && state.screenFlash <= 0) {
+    return;
+  }
+
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+
+  state.lineBursts.forEach((burst) => {
+    const t = burst.age / burst.life;
+    const strength = (1 - t) * (1 - t) * burst.strength;
+    const y = (burst.row + 0.5) * CELL;
+    const height = CELL * (0.65 + t * 3.2);
+
+    const grad = ctx.createLinearGradient(0, y - height / 2, 0, y + height / 2);
+    grad.addColorStop(0, rgba(burst.color, 0));
+    grad.addColorStop(0.5, rgba(burst.color, 0.58 * strength));
+    grad.addColorStop(1, rgba(burst.color, 0));
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, y - height / 2, gameCanvas.width, height);
+  });
+
+  state.particles.forEach((particle) => {
+    const life = particle.age / particle.life;
+    const alpha = Math.max(0, 1 - life);
+    ctx.fillStyle = rgba(particle.color, alpha * 0.9);
+    ctx.beginPath();
+    ctx.arc(particle.x, particle.y, particle.size * (0.5 + alpha * 0.5), 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  if (state.screenFlash > 0) {
+    ctx.fillStyle = `rgba(255, 255, 255, ${state.screenFlash * 0.22})`;
+    ctx.fillRect(0, 0, gameCanvas.width, gameCanvas.height);
+  }
+  ctx.restore();
+}
+
 function drawGame() {
   ctx.clearRect(0, 0, gameCanvas.width, gameCanvas.height);
   drawBoardBackground();
   drawBoardGrid();
   drawBoard();
   drawCurrentPiece();
+  drawVisualEffects();
 }
 
 function showOverlay(title, text) {
@@ -538,6 +846,9 @@ function resetGame() {
   state.lastTime = 0;
   state.renderTime = 0;
   state.boardPulse = 0;
+  state.lineBursts = [];
+  state.particles = [];
+  state.screenFlash = 0;
   state.paused = false;
   state.gameOver = false;
   state.jelly = createJellyState();
@@ -556,6 +867,7 @@ function moveHorizontal(dir) {
     state.current.x -= dir;
     return;
   }
+  playSfx("move", { dir });
   kickJelly(-0.05, 0.045, dir * 0.035, 0.08);
 }
 
@@ -568,6 +880,7 @@ function softDrop() {
   if (movedRows > 0) {
     state.score += movedRows;
     updateStats();
+    playSfx("softDrop");
   }
   kickJelly(0.05, -0.065, 0, 0.08);
 }
@@ -581,6 +894,7 @@ function hardDrop() {
   state.current.y = ghostY;
   state.fallProgress = 0;
   state.score += distance * 2;
+  playSfx("hardDrop");
   kickJelly(0.22, -0.28, 0, 0.4);
   lockPiece();
 }
@@ -596,6 +910,7 @@ function rotateCurrent(dir = 1) {
   for (const offset of offsets) {
     state.current.x = originalX + offset;
     if (!collide(state.board, state.current)) {
+      playSfx("rotate");
       kickJelly(0.045, -0.05, dir * 0.1, 0.12);
       return;
     }
@@ -621,10 +936,12 @@ function holdPiece() {
     state.fallProgress = 0;
     if (collide(state.board, state.current)) {
       state.gameOver = true;
+      playSfx("gameOver");
       showOverlay("游戏结束", "按回车或点击“重新开始”");
     }
   }
   state.canHold = false;
+  playSfx("hold");
   kickJelly(0.075, -0.09, 0.04, 0.14);
 }
 
@@ -634,13 +951,16 @@ function togglePause() {
   }
   state.paused = !state.paused;
   if (state.paused) {
+    playSfx("pause");
     showOverlay("已暂停", "按 P 或 Esc 继续游戏");
   } else {
+    playSfx("resume");
     hideOverlay();
   }
 }
 
 function handleKeydown(event) {
+  unlockAudio();
   switch (event.code) {
     case "ArrowLeft":
     case "KeyA":
@@ -732,6 +1052,7 @@ function setupTouchControls() {
     const action = button.dataset.action;
     button.addEventListener("pointerdown", (event) => {
       event.preventDefault();
+      unlockAudio();
       if (!action) {
         return;
       }
@@ -779,6 +1100,7 @@ function setupMouseControls() {
       return;
     }
     event.preventDefault();
+    unlockAudio();
     drag.active = true;
     drag.button = event.button;
     drag.startX = event.clientX;
@@ -849,6 +1171,7 @@ function update(time = 0) {
   }
 
   updateJelly(delta);
+  updateVisualEffects(delta);
   drawGame();
   drawMiniCanvas(nextCtx, state.nextType);
   drawMiniCanvas(holdCtx, state.holdType);
@@ -861,7 +1184,10 @@ function init() {
   drawMiniCanvas(holdCtx, state.holdType);
   setupTouchControls();
   setupMouseControls();
-  restartBtn.addEventListener("click", resetGame);
+  restartBtn.addEventListener("click", () => {
+    unlockAudio();
+    resetGame();
+  });
   document.addEventListener("keydown", handleKeydown);
   requestAnimationFrame(update);
 }
