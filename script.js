@@ -6,6 +6,8 @@ const GRAVITY_STEP = 0.42;
 const BASE_MAX_FALL_SPEED = 8.6;
 const MAX_FALL_STEP = 0.78;
 const SOFT_DROP_FORCE = 7.5;
+const DRAG_STEP_PX = 24;
+const CLICK_MOVE_TOLERANCE = 6;
 
 const LINE_POINTS = [0, 40, 100, 300, 1200];
 
@@ -740,6 +742,90 @@ function setupTouchControls() {
   });
 }
 
+function setupMouseControls() {
+  const drag = {
+    active: false,
+    button: -1,
+    startX: 0,
+    startY: 0,
+    lastX: 0,
+    accumX: 0,
+    moved: false,
+  };
+
+  function resetDrag() {
+    drag.active = false;
+    drag.button = -1;
+    drag.startX = 0;
+    drag.startY = 0;
+    drag.lastX = 0;
+    drag.accumX = 0;
+    drag.moved = false;
+  }
+
+  gameCanvas.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+  });
+
+  gameCanvas.addEventListener("mousedown", (event) => {
+    if (event.button !== 0 && event.button !== 2) {
+      return;
+    }
+    event.preventDefault();
+    drag.active = true;
+    drag.button = event.button;
+    drag.startX = event.clientX;
+    drag.startY = event.clientY;
+    drag.lastX = event.clientX;
+    drag.accumX = 0;
+    drag.moved = false;
+  });
+
+  window.addEventListener("mousemove", (event) => {
+    if (!drag.active || state.paused || state.gameOver) {
+      return;
+    }
+    const deltaX = event.clientX - drag.lastX;
+    drag.lastX = event.clientX;
+    drag.accumX += deltaX;
+
+    while (drag.accumX <= -DRAG_STEP_PX) {
+      moveHorizontal(-1);
+      drag.accumX += DRAG_STEP_PX;
+      drag.moved = true;
+    }
+    while (drag.accumX >= DRAG_STEP_PX) {
+      moveHorizontal(1);
+      drag.accumX -= DRAG_STEP_PX;
+      drag.moved = true;
+    }
+  });
+
+  window.addEventListener("mouseup", (event) => {
+    if (!drag.active || event.button !== drag.button) {
+      return;
+    }
+    const totalMoveX = Math.abs(event.clientX - drag.startX);
+    const totalMoveY = Math.abs(event.clientY - drag.startY);
+    const isClick =
+      !drag.moved &&
+      totalMoveX <= CLICK_MOVE_TOLERANCE &&
+      totalMoveY <= CLICK_MOVE_TOLERANCE;
+
+    if (isClick && !state.paused && !state.gameOver) {
+      if (drag.button === 0) {
+        rotateCurrent(-1);
+      } else if (drag.button === 2) {
+        rotateCurrent(1);
+      }
+    }
+
+    resetDrag();
+  });
+
+  window.addEventListener("blur", resetDrag);
+}
+
 function update(time = 0) {
   if (!state.lastTime) {
     state.lastTime = time;
@@ -771,6 +857,7 @@ function init() {
   drawMiniCanvas(nextCtx, state.nextType);
   drawMiniCanvas(holdCtx, state.holdType);
   setupTouchControls();
+  setupMouseControls();
   restartBtn.addEventListener("click", resetGame);
   document.addEventListener("keydown", handleKeydown);
   requestAnimationFrame(update);
