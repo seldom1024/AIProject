@@ -36,6 +36,18 @@
           </article>
         </div>
 
+        <div class="mode-readout">
+          <p id="modeBadge">经典模式</p>
+          <p id="rhythmMeta">BPM 132 ×1.00</p>
+        </div>
+
+        <div id="energyWrap" class="energy-wrap hidden">
+          <div class="energy-track">
+            <span id="energyFill"></span>
+          </div>
+          <p id="energyText">节奏能量 0%</p>
+        </div>
+
         <div class="mini-wrap">
           <section class="mini-card">
             <h3>下一个</h3>
@@ -60,6 +72,10 @@
 
       <aside class="panel controls-panel">
         <h2>操作</h2>
+        <div class="mode-switch" role="group" aria-label="游戏模式切换">
+          <button id="classicModeBtn" class="mode-btn active" type="button">经典模式</button>
+          <button id="rhythmModeBtn" class="mode-btn" type="button">音游模式</button>
+        </div>
         <ul class="tips">
           <li>方向键或 WASD：左右移动 / 下落（W/↑ 右旋）</li>
           <li>Q/Z：左旋；E/X：右旋</li>
@@ -69,6 +85,8 @@
           <li>鼠标左键点按：左旋；右键点按：右旋</li>
           <li>按住鼠标水平拖动：左拖左移，右拖右移</li>
           <li>关卡模式：每消 10 行升 1 级，前期慢、后期加速更陡（无限等级）</li>
+          <li>音游模式：按 BPM 节拍下落，旋转/硬降命中 ±100ms 得 Perfect</li>
+          <li>扫描线会横扫待消行区域，经过后才会正式清除</li>
           <li>全程魔性 BGM（游戏中循环，暂停/结束自动停）</li>
         </ul>
 

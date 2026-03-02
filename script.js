@@ -6,6 +6,9 @@ const SOFT_DROP_STEP = 0.65;
 const DRAG_STEP_PX = 24;
 const CLICK_MOVE_TOLERANCE = 6;
 const MAX_PARTICLES = 260;
+const RHYTHM_BPM = 132;
+const RHYTHM_WINDOW_MS = 100;
+const RHYTHM_SCAN_BEATS = 4;
 
 const LINE_POINTS = [0, 40, 100, 300, 1200];
 
@@ -44,6 +47,13 @@ const overlayTitle = document.getElementById("overlayTitle");
 const overlayText = document.getElementById("overlayText");
 const restartBtn = document.getElementById("restartBtn");
 const touchButtons = Array.from(document.querySelectorAll(".touch-controls button"));
+const classicModeBtn = document.getElementById("classicModeBtn");
+const rhythmModeBtn = document.getElementById("rhythmModeBtn");
+const modeBadgeEl = document.getElementById("modeBadge");
+const rhythmMetaEl = document.getElementById("rhythmMeta");
+const energyWrapEl = document.getElementById("energyWrap");
+const energyFillEl = document.getElementById("energyFill");
+const energyTextEl = document.getElementById("energyText");
 
 const CELL = gameCanvas.width / COLS;
 
@@ -55,7 +65,8 @@ const audioEngine = {
   bgmPlaying: false,
   bgmStep: 0,
   bgmNextAt: 0,
-  bpm: 132,
+  songStartAt: 0,
+  bpm: RHYTHM_BPM,
 };
 
 const state = {
@@ -65,6 +76,7 @@ const state = {
   nextType: null,
   holdType: null,
   canHold: true,
+  mode: "classic",
   score: 0,
   lines: 0,
   level: 1,
@@ -79,6 +91,7 @@ const state = {
   paused: false,
   gameOver: false,
   jelly: createJellyState(),
+  rhythm: createRhythmState(),
 };
 
 function createMatrix(w, h) {
@@ -97,6 +110,26 @@ function createJellyState() {
   };
 }
 
+function createRhythmState() {
+  return {
+    bpm: RHYTHM_BPM,
+    multiplier: 1,
+    beatWindowMs: RHYTHM_WINDOW_MS,
+    scanBeats: RHYTHM_SCAN_BEATS,
+    fallbackStartAt: performance.now() / 1000,
+    lastBeatIndex: -1,
+    scanX: 0,
+    scanCycle: 0,
+    pendingClears: [],
+    perfectEnergy: 0,
+    perfectText: "",
+    perfectTextAge: 0,
+    perfectTextLife: 0,
+    beatPulse: 0,
+    perfectFlash: 0,
+  };
+}
+
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
@@ -106,6 +139,13 @@ function calcFallSpeed(level) {
   const earlyCurve = Math.pow(lv - 1, 1.15) * 0.08;
   const lateCurve = Math.pow(Math.max(0, lv - 12), 1.8) * 0.016;
   return BASE_FALL_SPEED + earlyCurve + lateCurve;
+}
+
+function calcRhythmMultiplier(level) {
+  const lv = Math.max(1, level);
+  const early = Math.pow(lv - 1, 1.1) * 0.018;
+  const late = Math.pow(Math.max(0, lv - 10), 1.7) * 0.01;
+  return Math.max(1, 1 + early + late);
 }
 
 function hexToRgb(hex) {
@@ -121,6 +161,38 @@ function hexToRgb(hex) {
 function rgba(hex, alpha) {
   const { r, g, b } = hexToRgb(hex);
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function getRhythmClockTime() {
+  const context = audioEngine.context;
+  if (context && context.state === "running" && audioEngine.songStartAt) {
+    return Math.max(0, context.currentTime - audioEngine.songStartAt);
+  }
+  return Math.max(0, performance.now() / 1000 - state.rhythm.fallbackStartAt);
+}
+
+function getRhythmBeatDuration() {
+  const rate = state.rhythm.bpm * state.rhythm.multiplier;
+  return 60 / Math.max(1, rate);
+}
+
+function getRhythmBeatFloat() {
+  return getRhythmClockTime() / getRhythmBeatDuration();
+}
+
+function evaluatePerfectTiming() {
+  if (state.mode !== "rhythm" || state.paused || state.gameOver) {
+    return { isPerfect: false, diffMs: Infinity };
+  }
+  const beatDuration = getRhythmBeatDuration();
+  const elapsed = getRhythmClockTime();
+  const beatPos = elapsed / beatDuration;
+  const nearest = Math.round(beatPos) * beatDuration;
+  const diffMs = Math.abs(elapsed - nearest) * 1000;
+  return {
+    isPerfect: diffMs <= state.rhythm.beatWindowMs,
+    diffMs,
+  };
 }
 
 function shuffle(arr) {
@@ -360,9 +432,14 @@ function startMagicBgm() {
   if (!context || context.state !== "running" || audioEngine.bgmPlaying) {
     return;
   }
+  audioEngine.bpm = state.rhythm.bpm;
   audioEngine.bgmPlaying = true;
   audioEngine.bgmStep = 0;
-  audioEngine.bgmNextAt = context.currentTime + 0.03;
+  audioEngine.songStartAt = context.currentTime + 0.03;
+  audioEngine.bgmNextAt = audioEngine.songStartAt;
+  state.rhythm.fallbackStartAt = performance.now() / 1000;
+  state.rhythm.lastBeatIndex = -1;
+  state.rhythm.scanCycle = 0;
   scheduleMagicBgm();
   audioEngine.bgmTimer = window.setInterval(scheduleMagicBgm, 45);
 }
@@ -373,6 +450,7 @@ function stopMagicBgm() {
     audioEngine.bgmTimer = null;
   }
   audioEngine.bgmPlaying = false;
+  audioEngine.songStartAt = 0;
 }
 
 function syncBgmState() {
@@ -472,12 +550,21 @@ function playSfx(name, payload = {}) {
 function updateLevelByLines(totalLines) {
   state.level = Math.floor(totalLines / 10) + 1;
   state.fallSpeed = calcFallSpeed(state.level);
+  state.rhythm.multiplier = calcRhythmMultiplier(state.level);
 }
 
 function updateStats() {
   scoreEl.textContent = `${state.score}`;
   linesEl.textContent = `${state.lines}`;
   levelEl.textContent = `${state.level}`;
+  modeBadgeEl.textContent = state.mode === "rhythm" ? "音游模式" : "经典模式";
+  rhythmMetaEl.textContent = `BPM ${state.rhythm.bpm} ×${state.rhythm.multiplier.toFixed(2)}`;
+  const energy = Math.round(state.rhythm.perfectEnergy);
+  energyFillEl.style.width = `${energy}%`;
+  energyTextEl.textContent = `节奏能量 ${energy}%`;
+  energyWrapEl.classList.toggle("hidden", state.mode !== "rhythm");
+  classicModeBtn.classList.toggle("active", state.mode === "classic");
+  rhythmModeBtn.classList.toggle("active", state.mode === "rhythm");
 }
 
 function clearLines() {
@@ -491,6 +578,105 @@ function clearLines() {
     }
   }
   return clearedRows;
+}
+
+function collectFullRowsExcludingPending() {
+  const pendingRows = new Set(
+    state.rhythm.pendingClears.flatMap((entry) => entry.rows),
+  );
+  const fullRows = [];
+  for (let y = ROWS - 1; y >= 0; y -= 1) {
+    if (pendingRows.has(y)) {
+      continue;
+    }
+    if (state.board[y].every((cell) => Boolean(cell))) {
+      fullRows.push(y);
+    }
+  }
+  return fullRows;
+}
+
+function removeRowsFromBoard(rows) {
+  const sorted = [...rows].sort((a, b) => b - a);
+  sorted.forEach((row) => {
+    state.board.splice(row, 1);
+    state.board.unshift(Array(COLS).fill(null));
+  });
+  return sorted;
+}
+
+function remapPendingRowsAfterRemoval(rows, removedRows) {
+  return rows
+    .map((row) => {
+      let shifted = row;
+      removedRows.forEach((removed) => {
+        if (shifted < removed) {
+          shifted += 1;
+        }
+      });
+      return shifted;
+    })
+    .filter((row) => row >= 0 && row < ROWS);
+}
+
+function queueRhythmClears(rows, colorHex) {
+  if (rows.length === 0) {
+    return;
+  }
+  const uniqueRows = [...new Set(rows)].sort((a, b) => a - b);
+  state.rhythm.pendingClears.push({
+    rows: uniqueRows,
+    count: uniqueRows.length,
+    queuedCycle: state.rhythm.scanCycle,
+    color: colorHex,
+  });
+}
+
+function resolveRhythmScanClears() {
+  if (state.rhythm.pendingClears.length === 0) {
+    return;
+  }
+  const mature = [];
+  const remain = [];
+  state.rhythm.pendingClears.forEach((entry) => {
+    if (state.rhythm.scanCycle > entry.queuedCycle) {
+      mature.push(entry);
+    } else {
+      remain.push(entry);
+    }
+  });
+  if (mature.length === 0) {
+    return;
+  }
+
+  const rowsToClear = [...new Set(mature.flatMap((entry) => entry.rows))];
+  if (rowsToClear.length === 0) {
+    state.rhythm.pendingClears = remain;
+    return;
+  }
+
+  const removedRows = removeRowsFromBoard(rowsToClear);
+  remain.forEach((entry) => {
+    entry.rows = remapPendingRowsAfterRemoval(entry.rows, removedRows);
+    entry.count = entry.rows.length;
+  });
+  state.rhythm.pendingClears = remain.filter((entry) => entry.count > 0);
+
+  const previousLevel = state.level;
+  mature.forEach((entry) => {
+    const lines = Math.max(1, Math.min(4, entry.count));
+    state.lines += entry.count;
+    state.score += LINE_POINTS[lines] * state.level;
+  });
+
+  updateLevelByLines(state.lines);
+  if (state.level > previousLevel) {
+    playSfx("levelUp");
+  }
+  const accentColor = mature[mature.length - 1].color || "#66d1ff";
+  triggerLineClearFx(removedRows, accentColor);
+  state.boardPulse = Math.min(1.55, state.boardPulse + 0.38 + removedRows.length * 0.2);
+  updateStats();
 }
 
 function addParticle(x, y, color, energy = 1) {
@@ -547,6 +733,70 @@ function updateVisualEffects(dt) {
   });
 
   state.screenFlash = Math.max(0, state.screenFlash - dt * 1.7);
+  state.rhythm.beatPulse = Math.max(0, state.rhythm.beatPulse - dt * 2.8);
+  state.rhythm.perfectFlash = Math.max(0, state.rhythm.perfectFlash - dt * 3.2);
+  if (state.rhythm.perfectTextLife > 0) {
+    state.rhythm.perfectTextAge += dt;
+    if (state.rhythm.perfectTextAge >= state.rhythm.perfectTextLife) {
+      state.rhythm.perfectText = "";
+      state.rhythm.perfectTextLife = 0;
+      state.rhythm.perfectTextAge = 0;
+    }
+  }
+}
+
+function triggerPerfect(action) {
+  const scoreBonus = action === "hardDrop" ? 80 : 28;
+  const energyGain = action === "hardDrop" ? 9 : 5;
+  state.score += scoreBonus;
+  state.rhythm.perfectEnergy = clamp(state.rhythm.perfectEnergy + energyGain, 0, 100);
+  state.rhythm.perfectText = `Perfect +${scoreBonus}`;
+  state.rhythm.perfectTextAge = 0;
+  state.rhythm.perfectTextLife = 0.75;
+  state.rhythm.perfectFlash = Math.min(1, state.rhythm.perfectFlash + 0.42);
+}
+
+function handleRhythmTimingBonus(action) {
+  if (state.mode !== "rhythm") {
+    return;
+  }
+  const { isPerfect } = evaluatePerfectTiming();
+  if (isPerfect) {
+    triggerPerfect(action);
+    updateStats();
+  }
+}
+
+function applyRhythmBeatDrop() {
+  if (!state.current || state.paused || state.gameOver) {
+    return;
+  }
+  state.current.y += 1;
+  if (collide(state.board, state.current)) {
+    state.current.y -= 1;
+    lockPiece();
+    return;
+  }
+  kickJelly(0.01, -0.016, 0, 0.04);
+}
+
+function updateRhythmSystem() {
+  const beatFloat = getRhythmBeatFloat();
+  const beatIndex = Math.floor(beatFloat);
+  if (state.rhythm.lastBeatIndex < 0) {
+    state.rhythm.lastBeatIndex = beatIndex;
+  }
+
+  while (beatIndex > state.rhythm.lastBeatIndex && !state.paused && !state.gameOver) {
+    state.rhythm.lastBeatIndex += 1;
+    state.rhythm.beatPulse = 1;
+    applyRhythmBeatDrop();
+  }
+
+  const scanProgress = (beatFloat % state.rhythm.scanBeats) / state.rhythm.scanBeats;
+  state.rhythm.scanX = clamp(scanProgress, 0, 1) * COLS;
+  state.rhythm.scanCycle = Math.floor(beatFloat / state.rhythm.scanBeats);
+  resolveRhythmScanClears();
 }
 
 function spawnPiece() {
@@ -568,23 +818,30 @@ function spawnPiece() {
 function lockPiece() {
   merge(state.board, state.current);
   const previousLevel = state.level;
-  const clearedRows = clearLines();
+  const clearedRows = state.mode === "rhythm" ? collectFullRowsExcludingPending() : clearLines();
   const cleared = clearedRows.length;
 
   if (cleared > 0) {
-    state.lines += cleared;
-    state.score += LINE_POINTS[cleared] * state.level;
-    updateLevelByLines(state.lines);
-    triggerLineClearFx(clearedRows, COLORS[state.current.type]);
-    if (state.level > previousLevel) {
-      playSfx("levelUp");
+    if (state.mode === "rhythm") {
+      queueRhythmClears(clearedRows, COLORS[state.current.type]);
+      state.boardPulse = Math.min(1.3, state.boardPulse + 0.22 + cleared * 0.09);
+      state.screenFlash = Math.min(1.1, state.screenFlash + 0.08 + cleared * 0.06);
+    } else {
+      state.lines += cleared;
+      state.score += LINE_POINTS[cleared] * state.level;
+      updateLevelByLines(state.lines);
+      triggerLineClearFx(clearedRows, COLORS[state.current.type]);
+      state.boardPulse = Math.min(1.45, state.boardPulse + 0.35 + cleared * 0.22);
     }
-    state.boardPulse = Math.min(1.45, state.boardPulse + 0.35 + cleared * 0.22);
     kickJelly(0.18, -0.24, 0, 0.46);
   } else {
     playSfx("lock");
     state.boardPulse = Math.min(1.15, state.boardPulse + 0.18);
     kickJelly(0.11, -0.14, 0, 0.24);
+  }
+
+  if (state.level > previousLevel) {
+    playSfx("levelUp");
   }
 
   spawnPiece();
@@ -752,6 +1009,9 @@ function drawMatrix(targetCtx, matrix, offsetX, offsetY, type, options = {}) {
 }
 
 function drawBoard() {
+  const pendingRows = state.mode === "rhythm"
+    ? new Set(state.rhythm.pendingClears.flatMap((entry) => entry.rows))
+    : null;
   for (let y = 0; y < ROWS; y += 1) {
     for (let x = 0; x < COLS; x += 1) {
       const cell = state.board[y][x];
@@ -760,7 +1020,10 @@ function drawBoard() {
       }
       const ripple =
         0.35 + 0.65 * ((Math.sin(state.renderTime * 0.01 + x * 0.55 + y * 0.42) + 1) / 2);
-      const pulse = state.boardPulse * ripple * 0.65;
+      const pendingBoost = pendingRows && pendingRows.has(y)
+        ? 0.34 + 0.32 * ((Math.sin(state.renderTime * 0.015 + x * 0.6) + 1) / 2)
+        : 0;
+      const pulse = state.boardPulse * ripple * 0.65 + pendingBoost;
       drawJellyCell(ctx, x, y, COLORS[cell], {
         alpha: 1,
         pulse,
@@ -893,6 +1156,51 @@ function drawVisualEffects() {
   ctx.restore();
 }
 
+function drawRhythmOverlay() {
+  if (state.mode !== "rhythm") {
+    return;
+  }
+  const scanX = (state.rhythm.scanX / COLS) * gameCanvas.width;
+  const beatAlpha = 0.14 + state.rhythm.beatPulse * 0.26;
+
+  ctx.save();
+  const scanGradient = ctx.createLinearGradient(scanX - 18, 0, scanX + 18, 0);
+  scanGradient.addColorStop(0, "rgba(83, 204, 255, 0)");
+  scanGradient.addColorStop(0.5, `rgba(83, 204, 255, ${0.52 + state.rhythm.beatPulse * 0.2})`);
+  scanGradient.addColorStop(1, "rgba(83, 204, 255, 0)");
+  ctx.fillStyle = scanGradient;
+  ctx.fillRect(scanX - 18, 0, 36, gameCanvas.height);
+
+  ctx.strokeStyle = `rgba(120, 220, 255, ${0.6 + state.rhythm.beatPulse * 0.3})`;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(scanX + 0.5, 0);
+  ctx.lineTo(scanX + 0.5, gameCanvas.height);
+  ctx.stroke();
+
+  ctx.strokeStyle = `rgba(255, 255, 255, ${beatAlpha})`;
+  ctx.lineWidth = 8;
+  ctx.strokeRect(4, 4, gameCanvas.width - 8, gameCanvas.height - 8);
+
+  if (state.rhythm.perfectFlash > 0) {
+    ctx.fillStyle = `rgba(112, 244, 216, ${state.rhythm.perfectFlash * 0.2})`;
+    ctx.fillRect(0, 0, gameCanvas.width, gameCanvas.height);
+  }
+
+  if (state.rhythm.perfectText) {
+    const t = state.rhythm.perfectTextLife > 0
+      ? state.rhythm.perfectTextAge / state.rhythm.perfectTextLife
+      : 1;
+    const alpha = clamp(1 - t, 0, 1);
+    const yOffset = t * 24;
+    ctx.font = "700 26px 'Space Grotesk', 'Noto Sans SC', sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillStyle = `rgba(130, 255, 226, ${0.9 * alpha})`;
+    ctx.fillText(state.rhythm.perfectText, gameCanvas.width / 2, 92 - yOffset);
+  }
+  ctx.restore();
+}
+
 function drawGame() {
   ctx.clearRect(0, 0, gameCanvas.width, gameCanvas.height);
   drawBoardBackground();
@@ -900,6 +1208,7 @@ function drawGame() {
   drawBoard();
   drawCurrentPiece();
   drawVisualEffects();
+  drawRhythmOverlay();
 }
 
 function showOverlay(title, text) {
@@ -933,6 +1242,7 @@ function resetGame() {
   state.paused = false;
   state.gameOver = false;
   state.jelly = createJellyState();
+  state.rhythm = createRhythmState();
   updateLevelByLines(0);
   spawnPiece();
   syncBgmState();
@@ -957,6 +1267,18 @@ function softDrop() {
   if (state.paused || state.gameOver) {
     return;
   }
+  if (state.mode === "rhythm") {
+    state.current.y += 1;
+    if (collide(state.board, state.current)) {
+      state.current.y -= 1;
+      lockPiece();
+      return;
+    }
+    state.score += 1;
+    updateStats();
+    kickJelly(0.04, -0.05, 0, 0.06);
+    return;
+  }
   state.fallProgress += SOFT_DROP_STEP;
   const movedRows = resolveFallProgress();
   if (movedRows > 0) {
@@ -976,6 +1298,7 @@ function hardDrop() {
   state.current.y = ghostY;
   state.fallProgress = 0;
   state.score += distance * 2;
+  handleRhythmTimingBonus("hardDrop");
   playSfx("hardDrop");
   kickJelly(0.22, -0.28, 0, 0.4);
   lockPiece();
@@ -992,6 +1315,7 @@ function rotateCurrent(dir = 1) {
   for (const offset of offsets) {
     state.current.x = originalX + offset;
     if (!collide(state.board, state.current)) {
+      handleRhythmTimingBonus("rotate");
       playSfx("rotate");
       kickJelly(0.045, -0.05, dir * 0.1, 0.12);
       return;
@@ -1117,6 +1441,33 @@ function runAction(action) {
   if (fn) {
     fn();
   }
+}
+
+function switchMode(mode) {
+  if (mode !== "classic" && mode !== "rhythm") {
+    return;
+  }
+  state.mode = mode;
+  resetGame();
+  if (mode === "rhythm") {
+    showOverlay("音游模式", "按节拍操作，命中 ±100ms 会得到 Perfect");
+    setTimeout(() => {
+      if (!state.paused && !state.gameOver && state.mode === "rhythm") {
+        hideOverlay();
+      }
+    }, 900);
+  }
+}
+
+function setupModeControls() {
+  classicModeBtn.addEventListener("click", () => {
+    unlockAudio();
+    switchMode("classic");
+  });
+  rhythmModeBtn.addEventListener("click", () => {
+    unlockAudio();
+    switchMode("rhythm");
+  });
 }
 
 function setupTouchControls() {
@@ -1250,8 +1601,12 @@ function update(time = 0) {
   state.renderTime += deltaMs;
 
   if (!state.paused && !state.gameOver) {
-    state.fallProgress += state.fallSpeed * delta;
-    resolveFallProgress();
+    if (state.mode === "rhythm") {
+      updateRhythmSystem();
+    } else {
+      state.fallProgress += state.fallSpeed * delta;
+      resolveFallProgress();
+    }
   }
 
   syncBgmState();
@@ -1269,6 +1624,7 @@ function init() {
   drawMiniCanvas(holdCtx, state.holdType);
   setupTouchControls();
   setupMouseControls();
+  setupModeControls();
   restartBtn.addEventListener("click", () => {
     unlockAudio();
     resetGame();
