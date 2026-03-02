@@ -1,6 +1,13 @@
 const COLS = 10;
 const ROWS = 20;
-const BASE_DROP_INTERVAL = 900;
+
+const BASE_GRAVITY = 2.8;
+const GRAVITY_STEP = 0.42;
+const BASE_MAX_FALL_SPEED = 8.6;
+const MAX_FALL_STEP = 0.78;
+const SOFT_DROP_FORCE = 7.5;
+
+const LINE_POINTS = [0, 40, 100, 300, 1200];
 
 const COLORS = {
   I: "#39c5ff",
@@ -21,8 +28,6 @@ const SHAPES = {
   T: [[0, 1, 0], [1, 1, 1]],
   Z: [[1, 1, 0], [0, 1, 1]],
 };
-
-const LINE_POINTS = [0, 40, 100, 300, 1200];
 
 const gameCanvas = document.getElementById("gameCanvas");
 const nextCanvas = document.getElementById("nextCanvas");
@@ -52,15 +57,36 @@ const state = {
   score: 0,
   lines: 0,
   level: 1,
-  dropInterval: BASE_DROP_INTERVAL,
-  dropCounter: 0,
+  gravity: BASE_GRAVITY,
+  maxFallSpeed: BASE_MAX_FALL_SPEED,
+  fallVelocity: 0,
+  fallProgress: 0,
   lastTime: 0,
+  renderTime: 0,
+  boardPulse: 0,
   paused: false,
   gameOver: false,
+  jelly: createJellyState(),
 };
 
 function createMatrix(w, h) {
   return Array.from({ length: h }, () => Array(w).fill(null));
+}
+
+function createJellyState() {
+  return {
+    scaleX: 1,
+    scaleY: 1,
+    rot: 0,
+    velScaleX: 0,
+    velScaleY: 0,
+    velRot: 0,
+    pulse: 0,
+  };
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
 
 function shuffle(arr) {
@@ -130,24 +156,59 @@ function rotate(matrix, dir) {
   return dir > 0 ? rotated.map((row) => row.reverse()) : rotated.reverse();
 }
 
-function resetGame() {
-  state.board = createMatrix(COLS, ROWS);
-  state.bag = [];
-  state.current = null;
-  state.nextType = getNextType();
-  state.holdType = null;
-  state.canHold = true;
-  state.score = 0;
-  state.lines = 0;
-  state.level = 1;
-  state.dropInterval = BASE_DROP_INTERVAL;
-  state.dropCounter = 0;
-  state.lastTime = 0;
-  state.paused = false;
-  state.gameOver = false;
-  spawnPiece();
-  hideOverlay();
-  updateStats();
+function kickJelly(scaleXDelta, scaleYDelta, rotDelta = 0, pulse = 0.06) {
+  const jelly = state.jelly;
+  jelly.scaleX += scaleXDelta * 0.45;
+  jelly.scaleY += scaleYDelta * 0.45;
+  jelly.velScaleX += scaleXDelta * 8.2;
+  jelly.velScaleY += scaleYDelta * 8.2;
+  jelly.velRot += rotDelta * 6;
+  jelly.pulse = Math.min(1.65, jelly.pulse + pulse);
+}
+
+function springStep(value, velocity, target, stiffness, damping, dt) {
+  const force = (target - value) * stiffness;
+  velocity += force * dt;
+  velocity *= Math.exp(-damping * dt);
+  value += velocity * dt;
+  return [value, velocity];
+}
+
+function updateJelly(dt) {
+  const jelly = state.jelly;
+  [jelly.scaleX, jelly.velScaleX] = springStep(jelly.scaleX, jelly.velScaleX, 1, 38, 11.5, dt);
+  [jelly.scaleY, jelly.velScaleY] = springStep(jelly.scaleY, jelly.velScaleY, 1, 38, 11.5, dt);
+  [jelly.rot, jelly.velRot] = springStep(jelly.rot, jelly.velRot, 0, 34, 10.4, dt);
+  jelly.scaleX = clamp(jelly.scaleX, 0.78, 1.26);
+  jelly.scaleY = clamp(jelly.scaleY, 0.78, 1.26);
+  jelly.rot = clamp(jelly.rot, -0.22, 0.22);
+  jelly.pulse = Math.max(0, jelly.pulse - dt * 1.85);
+  state.boardPulse = Math.max(0, state.boardPulse - dt * 1.12);
+}
+
+function updateLevelByLines(totalLines) {
+  state.level = Math.floor(totalLines / 10) + 1;
+  state.gravity = BASE_GRAVITY + (state.level - 1) * GRAVITY_STEP;
+  state.maxFallSpeed = BASE_MAX_FALL_SPEED + (state.level - 1) * MAX_FALL_STEP;
+}
+
+function updateStats() {
+  scoreEl.textContent = `${state.score}`;
+  linesEl.textContent = `${state.lines}`;
+  levelEl.textContent = `${state.level}`;
+}
+
+function clearLines() {
+  let linesCleared = 0;
+  for (let y = ROWS - 1; y >= 0; y -= 1) {
+    if (state.board[y].every((cell) => Boolean(cell))) {
+      state.board.splice(y, 1);
+      state.board.unshift(Array(COLS).fill(null));
+      linesCleared += 1;
+      y += 1;
+    }
+  }
+  return linesCleared;
 }
 
 function spawnPiece() {
@@ -155,13 +216,56 @@ function spawnPiece() {
   state.current.x = Math.floor((COLS - state.current.matrix[0].length) / 2);
   state.nextType = getNextType();
   state.canHold = true;
+  state.fallVelocity = 0.45 + Math.min(2.4, state.level * 0.12);
+  state.fallProgress = 0;
+  kickJelly(0.03, -0.04, 0, 0.09);
+
   if (collide(state.board, state.current)) {
     state.gameOver = true;
     showOverlay("游戏结束", "按回车或点击“重新开始”");
   }
 }
 
+function lockPiece() {
+  merge(state.board, state.current);
+  const cleared = clearLines();
+
+  if (cleared > 0) {
+    state.lines += cleared;
+    state.score += LINE_POINTS[cleared] * state.level;
+    updateLevelByLines(state.lines);
+    state.boardPulse = Math.min(1.45, state.boardPulse + 0.35 + cleared * 0.22);
+    kickJelly(0.18, -0.24, 0, 0.46);
+  } else {
+    state.boardPulse = Math.min(1.15, state.boardPulse + 0.18);
+    kickJelly(0.11, -0.14, 0, 0.24);
+  }
+
+  spawnPiece();
+  updateStats();
+}
+
+function resolveFallProgress() {
+  let movedRows = 0;
+  while (state.fallProgress >= 1 && !state.paused && !state.gameOver) {
+    state.fallProgress -= 1;
+    state.current.y += 1;
+    if (collide(state.board, state.current)) {
+      state.current.y -= 1;
+      state.fallProgress = 0;
+      lockPiece();
+      return movedRows;
+    }
+    movedRows += 1;
+    kickJelly(0.006, -0.011, 0, 0.015);
+  }
+  return movedRows;
+}
+
 function getGhostY() {
+  if (!state.current) {
+    return 0;
+  }
   const ghost = {
     ...state.current,
     matrix: state.current.matrix,
@@ -186,23 +290,86 @@ function shade(hex, amount) {
   return `rgb(${r}, ${g}, ${b})`;
 }
 
-function drawCell(targetCtx, x, y, color, alpha = 1) {
-  const px = x * CELL;
-  const py = y * CELL;
-  const gradient = targetCtx.createLinearGradient(px, py, px + CELL, py + CELL);
-  gradient.addColorStop(0, shade(color, 22));
-  gradient.addColorStop(1, shade(color, -14));
+function roundedRectPath(targetCtx, x, y, w, h, radius) {
+  const r = Math.min(radius, w / 2, h / 2);
+  targetCtx.beginPath();
+  targetCtx.moveTo(x + r, y);
+  targetCtx.lineTo(x + w - r, y);
+  targetCtx.quadraticCurveTo(x + w, y, x + w, y + r);
+  targetCtx.lineTo(x + w, y + h - r);
+  targetCtx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  targetCtx.lineTo(x + r, y + h);
+  targetCtx.quadraticCurveTo(x, y + h, x, y + h - r);
+  targetCtx.lineTo(x, y + r);
+  targetCtx.quadraticCurveTo(x, y, x + r, y);
+  targetCtx.closePath();
+}
+
+function drawJellyCell(targetCtx, gx, gy, color, options = {}) {
+  const {
+    alpha = 1,
+    pulse = 0,
+    wobble = 0,
+    size = CELL,
+  } = options;
+
+  const px = gx * size;
+  const py = gy * size;
+  const inset = Math.max(0.9, size * 0.07 - pulse * 0.5);
+  const blockSize = size - inset * 2;
+  const centerX = px + size / 2;
+  const centerY = py + size / 2;
+  const radius = Math.max(4, blockSize * 0.24 + pulse * 1.8);
+  const stretchX = 1 + wobble * 0.02 + pulse * 0.02;
+  const stretchY = 1 - wobble * 0.02 - pulse * 0.015;
+
+  targetCtx.save();
   targetCtx.globalAlpha = alpha;
+  targetCtx.translate(centerX, centerY);
+  targetCtx.scale(stretchX, stretchY);
+  targetCtx.translate(-centerX, -centerY);
+
+  const gradient = targetCtx.createLinearGradient(px, py, px + size, py + size);
+  gradient.addColorStop(0, shade(color, 30));
+  gradient.addColorStop(0.58, shade(color, 7));
+  gradient.addColorStop(1, shade(color, -20));
+
+  roundedRectPath(targetCtx, px + inset, py + inset, blockSize, blockSize, radius);
   targetCtx.fillStyle = gradient;
-  targetCtx.fillRect(px + 1, py + 1, CELL - 2, CELL - 2);
-  targetCtx.strokeStyle = "rgba(255, 255, 255, 0.26)";
-  targetCtx.lineWidth = 1;
-  targetCtx.strokeRect(px + 1.5, py + 1.5, CELL - 3, CELL - 3);
-  targetCtx.globalAlpha = 1;
+  targetCtx.fill();
+
+  const gloss = targetCtx.createLinearGradient(px, py, px, py + blockSize * 0.8);
+  gloss.addColorStop(0, "rgba(255, 255, 255, 0.5)");
+  gloss.addColorStop(1, "rgba(255, 255, 255, 0)");
+  roundedRectPath(
+    targetCtx,
+    px + inset + blockSize * 0.11,
+    py + inset + blockSize * 0.08,
+    blockSize * 0.78,
+    blockSize * 0.5,
+    radius * 0.65,
+  );
+  targetCtx.fillStyle = gloss;
+  targetCtx.fill();
+
+  targetCtx.strokeStyle = `rgba(255, 255, 255, ${0.2 + pulse * 0.26})`;
+  targetCtx.lineWidth = 1.05;
+  roundedRectPath(targetCtx, px + inset, py + inset, blockSize, blockSize, radius);
+  targetCtx.stroke();
+
+  targetCtx.restore();
+}
+
+function drawBoardBackground() {
+  const gradient = ctx.createLinearGradient(0, 0, 0, gameCanvas.height);
+  gradient.addColorStop(0, "rgba(255, 255, 255, 0.04)");
+  gradient.addColorStop(1, "rgba(0, 0, 0, 0.12)");
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, gameCanvas.width, gameCanvas.height);
 }
 
 function drawBoardGrid() {
-  ctx.strokeStyle = "rgba(255, 255, 255, 0.06)";
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.065)";
   ctx.lineWidth = 1;
   for (let x = 0; x <= COLS; x += 1) {
     ctx.beginPath();
@@ -218,101 +385,171 @@ function drawBoardGrid() {
   }
 }
 
-function drawMatrix(targetCtx, matrix, offsetX, offsetY, type, alpha = 1) {
+function drawMatrix(targetCtx, matrix, offsetX, offsetY, type, options = {}) {
+  const { alpha = 1, pulse = 0, phase = 0, size = CELL } = options;
   for (let y = 0; y < matrix.length; y += 1) {
     for (let x = 0; x < matrix[y].length; x += 1) {
       if (!matrix[y][x]) {
         continue;
       }
-      drawCell(targetCtx, x + offsetX, y + offsetY, COLORS[type], alpha);
+      const wobble = Math.sin(
+        state.renderTime * 0.008 + (x + offsetX) * 0.74 + (y + offsetY) * 0.51 + phase,
+      );
+      drawJellyCell(targetCtx, x + offsetX, y + offsetY, COLORS[type], {
+        alpha,
+        pulse,
+        wobble,
+        size,
+      });
     }
   }
 }
 
-function drawGame() {
-  ctx.clearRect(0, 0, gameCanvas.width, gameCanvas.height);
-  drawBoardGrid();
+function drawBoard() {
   for (let y = 0; y < ROWS; y += 1) {
     for (let x = 0; x < COLS; x += 1) {
       const cell = state.board[y][x];
-      if (cell) {
-        drawCell(ctx, x, y, COLORS[cell], 1);
+      if (!cell) {
+        continue;
       }
+      const ripple =
+        0.35 + 0.65 * ((Math.sin(state.renderTime * 0.01 + x * 0.55 + y * 0.42) + 1) / 2);
+      const pulse = state.boardPulse * ripple * 0.65;
+      drawJellyCell(ctx, x, y, COLORS[cell], {
+        alpha: 1,
+        pulse,
+        wobble: ripple - 0.5,
+      });
     }
   }
+}
 
-  if (state.current && !state.gameOver) {
-    const ghostY = getGhostY();
-    drawMatrix(ctx, state.current.matrix, state.current.x, ghostY, state.current.type, 0.28);
-    drawMatrix(ctx, state.current.matrix, state.current.x, state.current.y, state.current.type, 1);
+function drawCurrentPiece() {
+  if (!state.current || state.gameOver) {
+    return;
   }
+
+  const ghostY = getGhostY();
+  drawMatrix(ctx, state.current.matrix, state.current.x, ghostY, state.current.type, {
+    alpha: 0.22,
+    pulse: 0.08 + state.boardPulse * 0.12,
+    phase: 1.4,
+  });
+
+  const renderY = state.current.y + state.fallProgress;
+  const centerX = (state.current.x + state.current.matrix[0].length / 2) * CELL;
+  const centerY = (renderY + state.current.matrix.length / 2) * CELL;
+
+  ctx.save();
+  ctx.translate(centerX, centerY);
+  ctx.rotate(state.jelly.rot + Math.sin(state.renderTime * 0.007) * 0.01);
+  ctx.scale(state.jelly.scaleX, state.jelly.scaleY);
+  ctx.translate(-centerX, -centerY);
+
+  drawMatrix(ctx, state.current.matrix, state.current.x, renderY, state.current.type, {
+    alpha: 1,
+    pulse: 0.44 + state.jelly.pulse * 0.58,
+    phase: 2.65,
+  });
+  ctx.restore();
+}
+
+function drawMiniCell(targetCtx, x, y, size, color) {
+  const px = x * size;
+  const py = y * size;
+  const inset = Math.max(1, size * 0.08);
+  const blockSize = size - inset * 2;
+  const radius = Math.max(3, blockSize * 0.25);
+
+  const gradient = targetCtx.createLinearGradient(px, py, px + size, py + size);
+  gradient.addColorStop(0, shade(color, 28));
+  gradient.addColorStop(1, shade(color, -18));
+  roundedRectPath(targetCtx, px + inset, py + inset, blockSize, blockSize, radius);
+  targetCtx.fillStyle = gradient;
+  targetCtx.fill();
+
+  targetCtx.strokeStyle = "rgba(255, 255, 255, 0.24)";
+  targetCtx.lineWidth = 1;
+  roundedRectPath(targetCtx, px + inset, py + inset, blockSize, blockSize, radius);
+  targetCtx.stroke();
 }
 
 function drawMiniCanvas(targetCtx, type) {
   targetCtx.clearRect(0, 0, targetCtx.canvas.width, targetCtx.canvas.height);
-  targetCtx.fillStyle = "rgba(255, 255, 255, 0.04)";
+  const bg = targetCtx.createLinearGradient(0, 0, 0, targetCtx.canvas.height);
+  bg.addColorStop(0, "rgba(255, 255, 255, 0.05)");
+  bg.addColorStop(1, "rgba(0, 0, 0, 0.16)");
+  targetCtx.fillStyle = bg;
   targetCtx.fillRect(0, 0, targetCtx.canvas.width, targetCtx.canvas.height);
+
   if (!type) {
     return;
   }
+
   const shape = SHAPES[type];
-  const miniCell = Math.floor(Math.min(targetCtx.canvas.width, targetCtx.canvas.height) / 5.5);
-  const width = shape[0].length * miniCell;
-  const height = shape.length * miniCell;
+  const cellSize = Math.floor(Math.min(targetCtx.canvas.width, targetCtx.canvas.height) / 5.5);
+  const width = shape[0].length * cellSize;
+  const height = shape.length * cellSize;
   const startX = Math.floor((targetCtx.canvas.width - width) / 2);
   const startY = Math.floor((targetCtx.canvas.height - height) / 2);
 
   shape.forEach((row, y) => {
-    row.forEach((v, x) => {
-      if (!v) {
+    row.forEach((value, x) => {
+      if (!value) {
         return;
       }
-      const px = startX + x * miniCell;
-      const py = startY + y * miniCell;
-      const gradient = targetCtx.createLinearGradient(px, py, px + miniCell, py + miniCell);
-      gradient.addColorStop(0, shade(COLORS[type], 22));
-      gradient.addColorStop(1, shade(COLORS[type], -14));
-      targetCtx.fillStyle = gradient;
-      targetCtx.fillRect(px + 1, py + 1, miniCell - 2, miniCell - 2);
-      targetCtx.strokeStyle = "rgba(255, 255, 255, 0.26)";
-      targetCtx.strokeRect(px + 1.5, py + 1.5, miniCell - 3, miniCell - 3);
+      drawMiniCell(
+        targetCtx,
+        (startX / cellSize) + x,
+        (startY / cellSize) + y,
+        cellSize,
+        COLORS[type],
+      );
     });
   });
 }
 
-function clearLines() {
-  let linesCleared = 0;
-  for (let y = ROWS - 1; y >= 0; y -= 1) {
-    if (state.board[y].every((cell) => Boolean(cell))) {
-      state.board.splice(y, 1);
-      state.board.unshift(Array(COLS).fill(null));
-      linesCleared += 1;
-      y += 1;
-    }
-  }
-  return linesCleared;
+function drawGame() {
+  ctx.clearRect(0, 0, gameCanvas.width, gameCanvas.height);
+  drawBoardBackground();
+  drawBoardGrid();
+  drawBoard();
+  drawCurrentPiece();
 }
 
-function updateStats() {
-  scoreEl.textContent = `${state.score}`;
-  linesEl.textContent = `${state.lines}`;
-  levelEl.textContent = `${state.level}`;
+function showOverlay(title, text) {
+  overlayTitle.textContent = title;
+  overlayText.textContent = text;
+  overlay.classList.remove("hidden");
 }
 
-function updateLevelByLines(totalLines) {
-  state.level = Math.floor(totalLines / 10) + 1;
-  state.dropInterval = Math.max(90, BASE_DROP_INTERVAL - (state.level - 1) * 65);
+function hideOverlay() {
+  overlay.classList.add("hidden");
 }
 
-function lockPiece() {
-  merge(state.board, state.current);
-  const cleared = clearLines();
-  if (cleared > 0) {
-    state.lines += cleared;
-    state.score += LINE_POINTS[cleared] * state.level;
-    updateLevelByLines(state.lines);
-  }
+function resetGame() {
+  state.board = createMatrix(COLS, ROWS);
+  state.bag = [];
+  state.current = null;
+  state.nextType = getNextType();
+  state.holdType = null;
+  state.canHold = true;
+  state.score = 0;
+  state.lines = 0;
+  state.level = 1;
+  state.gravity = BASE_GRAVITY;
+  state.maxFallSpeed = BASE_MAX_FALL_SPEED;
+  state.fallVelocity = 0;
+  state.fallProgress = 0;
+  state.lastTime = 0;
+  state.renderTime = 0;
+  state.boardPulse = 0;
+  state.paused = false;
+  state.gameOver = false;
+  state.jelly = createJellyState();
+  updateLevelByLines(0);
   spawnPiece();
+  hideOverlay();
   updateStats();
 }
 
@@ -323,35 +560,36 @@ function moveHorizontal(dir) {
   state.current.x += dir;
   if (collide(state.board, state.current)) {
     state.current.x -= dir;
+    return;
   }
+  kickJelly(-0.05, 0.045, dir * 0.035, 0.08);
 }
 
 function softDrop() {
   if (state.paused || state.gameOver) {
     return;
   }
-  state.current.y += 1;
-  if (collide(state.board, state.current)) {
-    state.current.y -= 1;
-    lockPiece();
-    return;
+  state.fallVelocity = Math.min(state.maxFallSpeed + 10, state.fallVelocity + SOFT_DROP_FORCE);
+  state.fallProgress += 0.48;
+  const movedRows = resolveFallProgress();
+  if (movedRows > 0) {
+    state.score += movedRows;
+    updateStats();
   }
-  state.score += 1;
-  updateStats();
+  kickJelly(0.05, -0.065, 0, 0.08);
 }
 
 function hardDrop() {
   if (state.paused || state.gameOver) {
     return;
   }
-  let distance = 0;
-  while (!collide(state.board, state.current)) {
-    state.current.y += 1;
-    distance += 1;
-  }
-  state.current.y -= 1;
-  distance = Math.max(0, distance - 1);
+  const ghostY = getGhostY();
+  const distance = Math.max(0, ghostY - state.current.y);
+  state.current.y = ghostY;
+  state.fallProgress = 0;
+  state.fallVelocity = 0;
   state.score += distance * 2;
+  kickJelly(0.22, -0.28, 0, 0.4);
   lockPiece();
 }
 
@@ -360,16 +598,18 @@ function rotateCurrent(dir = 1) {
     return;
   }
   const original = state.current.matrix;
+  const originalX = state.current.x;
   state.current.matrix = rotate(state.current.matrix, dir);
   const offsets = [0, -1, 1, -2, 2];
   for (const offset of offsets) {
-    state.current.x += offset;
+    state.current.x = originalX + offset;
     if (!collide(state.board, state.current)) {
+      kickJelly(0.045, -0.05, dir * 0.1, 0.12);
       return;
     }
-    state.current.x -= offset;
   }
   state.current.matrix = original;
+  state.current.x = originalX;
 }
 
 function holdPiece() {
@@ -386,12 +626,15 @@ function holdPiece() {
     state.current = createPiece(swap);
     state.current.x = Math.floor((COLS - state.current.matrix[0].length) / 2);
     state.current.y = -1;
+    state.fallVelocity = 0.45 + Math.min(2.4, state.level * 0.12);
+    state.fallProgress = 0;
     if (collide(state.board, state.current)) {
       state.gameOver = true;
       showOverlay("游戏结束", "按回车或点击“重新开始”");
     }
   }
   state.canHold = false;
+  kickJelly(0.075, -0.09, 0.04, 0.14);
 }
 
 function togglePause() {
@@ -468,9 +711,9 @@ function setupTouchControls() {
   const repeatable = new Set(["left", "right", "down"]);
 
   const clearRepeat = (button) => {
-    const t = holdRepeat.get(button);
-    if (t) {
-      clearInterval(t);
+    const timer = holdRepeat.get(button);
+    if (timer) {
+      clearInterval(timer);
       holdRepeat.delete(button);
     }
     button.classList.remove("active");
@@ -478,15 +721,15 @@ function setupTouchControls() {
 
   touchButtons.forEach((button) => {
     const action = button.dataset.action;
-    button.addEventListener("pointerdown", (e) => {
-      e.preventDefault();
+    button.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
       if (!action) {
         return;
       }
       button.classList.add("active");
       runAction(action);
       if (repeatable.has(action)) {
-        const timer = setInterval(() => runAction(action), 95);
+        const timer = setInterval(() => runAction(action), 90);
         holdRepeat.set(button, timer);
       }
     });
@@ -497,35 +740,26 @@ function setupTouchControls() {
   });
 }
 
-function showOverlay(title, text) {
-  overlayTitle.textContent = title;
-  overlayText.textContent = text;
-  overlay.classList.remove("hidden");
-}
-
-function hideOverlay() {
-  overlay.classList.add("hidden");
-}
-
 function update(time = 0) {
   if (!state.lastTime) {
     state.lastTime = time;
   }
-  const delta = time - state.lastTime;
+
+  const deltaMs = time - state.lastTime;
+  const delta = Math.min(0.05, Math.max(0, deltaMs / 1000));
   state.lastTime = time;
+  state.renderTime += deltaMs;
 
   if (!state.paused && !state.gameOver) {
-    state.dropCounter += delta;
-    if (state.dropCounter >= state.dropInterval) {
-      state.current.y += 1;
-      if (collide(state.board, state.current)) {
-        state.current.y -= 1;
-        lockPiece();
-      }
-      state.dropCounter = 0;
-    }
+    state.fallVelocity = Math.min(
+      state.maxFallSpeed,
+      state.fallVelocity + state.gravity * delta,
+    );
+    state.fallProgress += state.fallVelocity * delta;
+    resolveFallProgress();
   }
 
+  updateJelly(delta);
   drawGame();
   drawMiniCanvas(nextCtx, state.nextType);
   drawMiniCanvas(holdCtx, state.holdType);
