@@ -1,11 +1,9 @@
 const COLS = 10;
 const ROWS = 20;
 
-const BASE_GRAVITY = 2.8;
-const GRAVITY_STEP = 0.42;
-const BASE_MAX_FALL_SPEED = 8.6;
-const MAX_FALL_STEP = 0.78;
-const SOFT_DROP_FORCE = 7.5;
+const BASE_FALL_SPEED = 1.05;
+const LEVEL_FALL_SPEED_STEP = 0.2;
+const SOFT_DROP_STEP = 0.65;
 const DRAG_STEP_PX = 24;
 const CLICK_MOVE_TOLERANCE = 6;
 
@@ -59,9 +57,7 @@ const state = {
   score: 0,
   lines: 0,
   level: 1,
-  gravity: BASE_GRAVITY,
-  maxFallSpeed: BASE_MAX_FALL_SPEED,
-  fallVelocity: 0,
+  fallSpeed: BASE_FALL_SPEED,
   fallProgress: 0,
   lastTime: 0,
   renderTime: 0,
@@ -190,8 +186,7 @@ function updateJelly(dt) {
 
 function updateLevelByLines(totalLines) {
   state.level = Math.floor(totalLines / 10) + 1;
-  state.gravity = BASE_GRAVITY + (state.level - 1) * GRAVITY_STEP;
-  state.maxFallSpeed = BASE_MAX_FALL_SPEED + (state.level - 1) * MAX_FALL_STEP;
+  state.fallSpeed = BASE_FALL_SPEED + (state.level - 1) * LEVEL_FALL_SPEED_STEP;
 }
 
 function updateStats() {
@@ -218,7 +213,6 @@ function spawnPiece() {
   state.current.x = Math.floor((COLS - state.current.matrix[0].length) / 2);
   state.nextType = getNextType();
   state.canHold = true;
-  state.fallVelocity = 0.45 + Math.min(2.4, state.level * 0.12);
   state.fallProgress = 0;
   kickJelly(0.03, -0.04, 0, 0.09);
 
@@ -539,9 +533,7 @@ function resetGame() {
   state.score = 0;
   state.lines = 0;
   state.level = 1;
-  state.gravity = BASE_GRAVITY;
-  state.maxFallSpeed = BASE_MAX_FALL_SPEED;
-  state.fallVelocity = 0;
+  state.fallSpeed = BASE_FALL_SPEED;
   state.fallProgress = 0;
   state.lastTime = 0;
   state.renderTime = 0;
@@ -571,8 +563,7 @@ function softDrop() {
   if (state.paused || state.gameOver) {
     return;
   }
-  state.fallVelocity = Math.min(state.maxFallSpeed + 10, state.fallVelocity + SOFT_DROP_FORCE);
-  state.fallProgress += 0.48;
+  state.fallProgress += SOFT_DROP_STEP;
   const movedRows = resolveFallProgress();
   if (movedRows > 0) {
     state.score += movedRows;
@@ -589,7 +580,6 @@ function hardDrop() {
   const distance = Math.max(0, ghostY - state.current.y);
   state.current.y = ghostY;
   state.fallProgress = 0;
-  state.fallVelocity = 0;
   state.score += distance * 2;
   kickJelly(0.22, -0.28, 0, 0.4);
   lockPiece();
@@ -628,7 +618,6 @@ function holdPiece() {
     state.current = createPiece(swap);
     state.current.x = Math.floor((COLS - state.current.matrix[0].length) / 2);
     state.current.y = -1;
-    state.fallVelocity = 0.45 + Math.min(2.4, state.level * 0.12);
     state.fallProgress = 0;
     if (collide(state.board, state.current)) {
       state.gameOver = true;
@@ -855,11 +844,7 @@ function update(time = 0) {
   state.renderTime += deltaMs;
 
   if (!state.paused && !state.gameOver) {
-    state.fallVelocity = Math.min(
-      state.maxFallSpeed,
-      state.fallVelocity + state.gravity * delta,
-    );
-    state.fallProgress += state.fallVelocity * delta;
+    state.fallProgress += state.fallSpeed * delta;
     resolveFallProgress();
   }
 
