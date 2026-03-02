@@ -51,6 +51,11 @@ const audioEngine = {
   context: null,
   master: null,
   lastPlayAt: {},
+  bgmTimer: null,
+  bgmPlaying: false,
+  bgmStep: 0,
+  bgmNextAt: 0,
+  bpm: 132,
 };
 
 const state = {
@@ -238,7 +243,11 @@ function unlockAudio() {
     return;
   }
   if (context.state === "suspended") {
-    context.resume().catch(() => {});
+    context.resume().then(() => {
+      syncBgmState();
+    }).catch(() => {});
+  } else {
+    syncBgmState();
   }
 }
 
@@ -287,6 +296,93 @@ function playTone({
   osc.stop(endTime + 0.012);
 }
 
+function midiToFreq(midi) {
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
+
+function scheduleMagicBgm() {
+  const context = audioEngine.context;
+  if (!context || context.state !== "running" || !audioEngine.bgmPlaying) {
+    return;
+  }
+
+  const lookAhead = 0.2;
+  const stepDuration = (60 / audioEngine.bpm) / 2;
+  const melodyPattern = [0, 3, 7, 10, 12, 10, 7, 3, 5, 8, 12, 15, 12, 8, 5, 3];
+  const bassPattern = [-12, -5, -9, -2, -12, -5, -7, -3];
+  const root = 57;
+
+  while (audioEngine.bgmNextAt < context.currentTime + lookAhead) {
+    const when = Math.max(0, audioEngine.bgmNextAt - context.currentTime);
+    const step = audioEngine.bgmStep;
+    const melodyMidi = root + melodyPattern[step % melodyPattern.length];
+    const bassMidi = root + bassPattern[Math.floor(step / 2) % bassPattern.length];
+    const accent = step % 8 === 0;
+
+    playTone({
+      freq: midiToFreq(melodyMidi),
+      toFreq: midiToFreq(melodyMidi + (accent ? 1 : 0)),
+      type: accent ? "square" : "triangle",
+      duration: stepDuration * 0.92,
+      volume: accent ? 0.055 : 0.045,
+      when,
+    });
+
+    if (step % 2 === 0) {
+      playTone({
+        freq: midiToFreq(bassMidi),
+        toFreq: midiToFreq(bassMidi - 0.5),
+        type: "sine",
+        duration: stepDuration * 1.8,
+        volume: 0.038,
+        when,
+      });
+    }
+
+    if (step % 4 === 2) {
+      playTone({
+        freq: midiToFreq(root + 19),
+        toFreq: midiToFreq(root + 22),
+        type: "triangle",
+        duration: stepDuration * 0.45,
+        volume: 0.018,
+        when: when + stepDuration * 0.2,
+      });
+    }
+
+    audioEngine.bgmStep += 1;
+    audioEngine.bgmNextAt += stepDuration;
+  }
+}
+
+function startMagicBgm() {
+  const context = audioEngine.context;
+  if (!context || context.state !== "running" || audioEngine.bgmPlaying) {
+    return;
+  }
+  audioEngine.bgmPlaying = true;
+  audioEngine.bgmStep = 0;
+  audioEngine.bgmNextAt = context.currentTime + 0.03;
+  scheduleMagicBgm();
+  audioEngine.bgmTimer = window.setInterval(scheduleMagicBgm, 45);
+}
+
+function stopMagicBgm() {
+  if (audioEngine.bgmTimer) {
+    clearInterval(audioEngine.bgmTimer);
+    audioEngine.bgmTimer = null;
+  }
+  audioEngine.bgmPlaying = false;
+}
+
+function syncBgmState() {
+  if (state.paused || state.gameOver) {
+    stopMagicBgm();
+    return;
+  }
+  startMagicBgm();
+}
+
 function playSfx(name, payload = {}) {
   if (!audioEngine.context || audioEngine.context.state !== "running") {
     return;
@@ -332,21 +428,6 @@ function playSfx(name, payload = {}) {
         return;
       }
       playTone({ freq: 340, toFreq: 248, type: "triangle", duration: 0.09, volume: 0.05 });
-      break;
-    }
-    case "clear": {
-      const lines = Math.max(1, Math.min(4, payload.lines || 1));
-      const chord = [523.25, 659.25, 783.99, 987.77];
-      for (let i = 0; i < lines; i += 1) {
-        playTone({
-          freq: chord[i],
-          toFreq: chord[i] * 1.02,
-          type: "square",
-          duration: 0.11,
-          volume: 0.06 + i * 0.01,
-          when: i * 0.032,
-        });
-      }
       break;
     }
     case "levelUp": {
@@ -478,6 +559,7 @@ function spawnPiece() {
 
   if (collide(state.board, state.current)) {
     state.gameOver = true;
+    syncBgmState();
     playSfx("gameOver");
     showOverlay("游戏结束", "按回车或点击“重新开始”");
   }
@@ -494,7 +576,6 @@ function lockPiece() {
     state.score += LINE_POINTS[cleared] * state.level;
     updateLevelByLines(state.lines);
     triggerLineClearFx(clearedRows, COLORS[state.current.type]);
-    playSfx("clear", { lines: cleared });
     if (state.level > previousLevel) {
       playSfx("levelUp");
     }
@@ -854,6 +935,7 @@ function resetGame() {
   state.jelly = createJellyState();
   updateLevelByLines(0);
   spawnPiece();
+  syncBgmState();
   hideOverlay();
   updateStats();
 }
@@ -936,6 +1018,7 @@ function holdPiece() {
     state.fallProgress = 0;
     if (collide(state.board, state.current)) {
       state.gameOver = true;
+      syncBgmState();
       playSfx("gameOver");
       showOverlay("游戏结束", "按回车或点击“重新开始”");
     }
@@ -950,6 +1033,7 @@ function togglePause() {
     return;
   }
   state.paused = !state.paused;
+  syncBgmState();
   if (state.paused) {
     playSfx("pause");
     showOverlay("已暂停", "按 P 或 Esc 继续游戏");
@@ -1170,6 +1254,7 @@ function update(time = 0) {
     resolveFallProgress();
   }
 
+  syncBgmState();
   updateJelly(delta);
   updateVisualEffects(delta);
   drawGame();
