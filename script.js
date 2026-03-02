@@ -645,7 +645,7 @@ function togglePause() {
   }
   state.paused = !state.paused;
   if (state.paused) {
-    showOverlay("已暂停", "按 P 键继续游戏");
+    showOverlay("已暂停", "按 P 或 Esc 继续游戏");
   } else {
     hideOverlay();
   }
@@ -654,32 +654,50 @@ function togglePause() {
 function handleKeydown(event) {
   switch (event.code) {
     case "ArrowLeft":
+    case "KeyA":
       event.preventDefault();
       moveHorizontal(-1);
       break;
     case "ArrowRight":
+    case "KeyD":
       event.preventDefault();
       moveHorizontal(1);
       break;
     case "ArrowDown":
+    case "KeyS":
       event.preventDefault();
       softDrop();
       break;
     case "ArrowUp":
+    case "KeyW":
+    case "KeyE":
+    case "KeyX":
       event.preventDefault();
       rotateCurrent(1);
+      break;
+    case "KeyQ":
+    case "KeyZ":
+      event.preventDefault();
+      rotateCurrent(-1);
       break;
     case "Space":
       event.preventDefault();
       hardDrop();
       break;
     case "KeyP":
+    case "Escape":
       event.preventDefault();
       togglePause();
       break;
     case "KeyC":
+    case "ShiftLeft":
+    case "ShiftRight":
       event.preventDefault();
       holdPiece();
+      break;
+    case "KeyR":
+      event.preventDefault();
+      resetGame();
       break;
     case "Enter":
       if (state.gameOver) {
